@@ -2,86 +2,38 @@
 
 This directory contains integration tests that verify the transaction integrity guarantees of the multi-context EFCore adapter feature.
 
-## ⚠️ Known Issue: Casbin.NET AutoSave Bug (Upstream)
+## ✅ Casbin.NET AutoSave Bug - FIXED in v2.19.1
 
 ### Test Status Summary
 
-| Test | Status | Reason |
-|------|--------|--------|
+| Test | Status | Description |
+|------|--------|-------------|
 | **AutoSaveTests.TestAutoSaveOn_MultiContext_IndividualCommits** | ✅ PASSING | Documents non-atomic behavior with AutoSave ON (expected) |
-| **AutoSaveTests.TestAutoSaveOff_MultiContext_RollbackOnFailure_ExpectingFix** | ❌ FAILING | Casbin.NET bug: groupings commit despite AutoSave OFF |
-| **AutoSaveTests.TestAutoSaveOff_MultiContext_BatchedCommit_ExpectingFix** | ❌ FAILING | Casbin.NET bug: groupings commit despite AutoSave OFF |
-| **AutoSaveTests.TestAutoSaveOff_MultiContext_MinimalBugRepro_ExpectingFix** | ❌ FAILING | Minimal repro for Casbin.NET bug |
-| **AutoSaveTests.TestGroupingPolicyAutoSaveOff_ExpectingFix** | ❌ FAILING | Casbin.NET bug: single-context version |
-| **AutoSaveTests.TestGroupingPolicyAutoSaveOffAsync_ExpectingFix** | ❌ FAILING | Casbin.NET bug: single-context async version |
+| **AutoSaveTests.TestAutoSaveOff_MultiContext_RollbackOnFailure** | ✅ PASSING | Verifies atomic rollback with AutoSave OFF |
+| **AutoSaveTests.TestAutoSaveOff_MultiContext_BatchedCommit** | ✅ PASSING | Verifies batched commit with AutoSave OFF |
+| **AutoSaveTests.TestGroupingPolicyAutoSaveOff** | ✅ PASSING | Single-context sync version |
+| **AutoSaveTests.TestGroupingPolicyAutoSaveOffAsync** | ✅ PASSING | Single-context async version |
 
-### Bug Summary
+### Bug History (RESOLVED)
 
-Casbin.NET has a bug where `AddGroupingPolicy()` and `AddNamedGroupingPolicy()` ignore the `EnableAutoSave(false)` setting:
-- ✅ `AddPolicy()` respects AutoSave OFF (doesn't call adapter)
-- ❌ `AddGroupingPolicy()` ignores AutoSave OFF (calls adapter immediately)
-- ❌ `AddNamedGroupingPolicy()` ignores AutoSave OFF (calls adapter immediately)
+Casbin.NET had a bug where `AddGroupingPolicy()` and `AddNamedGroupingPolicy()` ignored the `EnableAutoSave(false)` setting. This was fixed in **Casbin.NET v2.19.1**.
 
-This violates Casbin documentation:
-> "When AutoSave is disabled, policy changes only affect the policy in Casbin enforcer, they do not affect the policy in the storage."
+**Previous behavior (bug):**
+- ✅ `AddPolicy()` respected AutoSave OFF (didn't call adapter)
+- ❌ `AddGroupingPolicy()` ignored AutoSave OFF (called adapter immediately)
+- ❌ `AddNamedGroupingPolicy()` ignored AutoSave OFF (called adapter immediately)
 
-### Evidence from Test Runs
+**Current behavior (fixed in v2.19.1):**
+- ✅ All policy methods now respect the `EnableAutoSave(false)` setting
+- ✅ Policies stay in memory until `SavePolicy()` is called
+- ✅ Atomic transactions work correctly with AutoSave OFF
 
-**Test output showing the bug:**
-```
-Database state BEFORE SavePolicy: (0, 2, 2)
-Expected: (0, 0, 0) with AutoSave OFF
+### Diagnostic Logging (Can Be Removed)
 
-✗✗✗ BUG CONFIRMED - AutoSave OFF saved to database!
-```
-
-**Diagnostic logs showing adapter calls:**
-```
-[ADAPTER] AddPolicy INVOKED: policyType=g, section=g
-[ADAPTER] Call stack:
-   at Casbin.ManagementEnforcerExtension.AddGroupingPolicy(...)
-[ADAPTER] Calling context.SaveChanges() to commit immediately
-[ADAPTER] SaveChanges() completed
-```
-
-### Impact on Integration Tests
-
-Five tests in **AutoSaveTests.cs** currently fail due to this Casbin.NET bug:
-1. `TestAutoSaveOff_MultiContext_RollbackOnFailure_ExpectingFix` - Can't test atomic rollback because groupings already committed
-2. `TestAutoSaveOff_MultiContext_BatchedCommit_ExpectingFix` - Can't test batched commit because groupings already committed
-3. `TestAutoSaveOff_MultiContext_MinimalBugRepro_ExpectingFix` - Minimal reproduction showing (0, 1, 1) instead of (0, 0, 0)
-4. `TestGroupingPolicyAutoSaveOff_ExpectingFix` - Single-context sync version showing (5, 6) instead of (5, 5)
-5. `TestGroupingPolicyAutoSaveOffAsync_ExpectingFix` - Single-context async version
-
-**These tests document the correct expected behavior and will pass once Casbin.NET fixes the bug.**
-
-### Diagnostic Logging
-
-The adapter code includes diagnostic Console.WriteLine statements that help understand the bug:
+The adapter code may still include diagnostic Console.WriteLine statements that were used to debug the bug. These can now be removed as the issue is resolved:
 - Shows when adapter methods are called
 - Shows call stacks proving Casbin.NET is calling the adapter
 - Shows SaveChanges() being invoked despite AutoSave OFF
-
-**These diagnostics will be kept until Casbin.NET fixes the bug**, then removed.
-
-### TODO: File Bug with Casbin.NET (Future Session)
-
-**In a separate session in the Casbin.NET repository**, we will:
-
-1. Create simplified reproduction test (SQLite, single context, no multi-context complexity)
-2. File bug report with Casbin.NET project
-3. Include evidence from our investigation (shown above)
-
-**Reference**: See `CASBIN_NET_BUG_NOTES.md` in repo root for detailed notes.
-
-### After Casbin.NET Fixes the Bug
-
-1. ✅ Update Casbin.NET dependency to fixed version
-2. ✅ Run integration tests - should all pass
-3. ✅ Remove diagnostic logging from EFCoreAdapter.cs
-4. ✅ Delete MINIMAL_AUTOSAVE_OFF_BugReproduction test
-5. ✅ Delete CASBIN_NET_BUG_NOTES.md
-6. ✅ Update this README to remove bug section
 
 ---
 

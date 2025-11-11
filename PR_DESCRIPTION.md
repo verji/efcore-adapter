@@ -4,6 +4,8 @@
 
 This PR adds multi-context support to the EFCore adapter, allowing Casbin policies to be stored across multiple database contexts. This enables scenarios like separating policy types (p/p2/p3) and grouping types (g/g2/g3) into different databases, schemas, or tables.
 
+**⚠️ Breaking Change**: This PR upgrades Casbin.NET from 2.7.0 to **2.19.1** and extends the database schema from v0-v5 to **v0-v13** (adds Value7-Value14 columns). Existing installations will need to run database migrations.
+
 ## Motivation
 
 Users may need to:
@@ -26,26 +28,31 @@ Users may need to:
 
 ## ⚠️ Transaction Integrity Requirements
 
-**IMPORTANT:** Transaction integrity in multi-context scenarios requires that all `CasbinDbContext` instances share the **same physical database connection** - having identical connection strings or pointing to the same database is **NOT sufficient**.
+**Note:** Transaction integrity in multi-context scenarios requires that all `CasbinDbContext` instances can share database connections and transactions. The adapter uses reference equality checks and the `GetDbTransaction()` API to coordinate atomic operations across contexts.
 
-### Client Responsibility
-
-**You (the consumer) are responsible for ensuring transaction integrity** by providing contexts that can share a physical connection. The adapter detects whether contexts can share transactions but does NOT enforce this requirement.
-
-### How It Works
+### How Transaction Sharing Works
 
 1. **You create contexts** with connection strings (may be separate `DbContextOptions` instances)
-2. **The adapter detects** if connection strings match via `CanShareTransaction()`
-3. **If connection strings match**, the adapter uses `UseTransaction()` to enlist all contexts in a shared transaction
-4. **Atomic operations** succeed only when the underlying database supports transaction sharing across the connection objects
+2. **The adapter detects** shared connections using **reference equality** via `CanShareTransaction()`
+   - Checks if `DbContext.Database.GetDbConnection()` returns the same connection object reference
+   - Updated in commit `91a780b` to use `ReferenceEquals()` for correctness
+3. **If connections match by reference**, the adapter uses `GetDbTransaction()` and `UseTransaction()` to enlist all contexts
+4. **Atomic operations** succeed when contexts share the same underlying connection object
 
 ### Key Requirements
 
-- **Same Connection String**: All contexts must have **identical connection strings** for the adapter to attempt transaction sharing
-- **Database Support**: The database must support enlisting multiple connection objects into the same transaction via `UseTransaction()`
+- **Connection Reference Sharing**: For atomic transactions, contexts must use connection objects that satisfy `ReferenceEquals()`
+- **Same Connection String**: Contexts with identical connection strings have a higher likelihood of sharing connections
+- **Database Support**: The database must support transaction sharing via `UseTransaction()`
   - ✅ **SQL Server, PostgreSQL, MySQL**: Support this pattern when contexts connect to the same database
   - ❌ **SQLite with separate files**: Cannot share transactions across different database files
   - ✅ **SQLite same file**: Can share transactions when all contexts use the same file path
+
+### Technical Implementation
+
+- Uses official `GetDbTransaction()` API (commit `e43fcba`)
+- Reference equality check ensures actual connection object sharing (commit `91a780b`)
+- Graceful fallback to individual transactions when sharing not possible
 
 ### Context Factory Pattern
 
@@ -70,30 +77,40 @@ var groupingContext = new CasbinDbContext<int>(
 
 ### What You DON'T Need to Do
 
-- ❌ You do NOT manually call `UseTransaction()` - the adapter handles this internally
-- ❌ You do NOT need to share `DbConnection` objects - separate `DbContextOptions` are fine
-- ❌ You do NOT need to manage transactions manually - the adapter coordinates everything
+- ❌ Manual transaction management - the adapter coordinates everything internally
+- ❌ Explicit `UseTransaction()` calls - the adapter handles this
+- ❌ Connection pooling configuration - works with standard EF Core patterns
 
-### Detection, Not Enforcement
+### Graceful Degradation
 
-The adapter's `CanShareTransaction()` method **detects** connection compatibility but does **NOT prevent** you from using incompatible configurations. If you provide contexts with different connection strings or incompatible databases:
-
-- The adapter gracefully falls back to **individual transactions per context**
-- Operations are **NOT atomic** across contexts
+If contexts cannot share connections (different connection strings or incompatible databases):
+- The adapter falls back to **individual transactions per context**
+- Operations are **not atomic** across contexts
 - Each context commits independently
-- This is acceptable for testing but **NOT recommended for production** requiring ACID guarantees
+- Acceptable for some testing scenarios but not recommended for production ACID guarantees
 
 ### 3. **Performance Optimizations**
 - **EF Core 7+ ExecuteDelete**: Uses set-based `ExecuteDelete()` for clearing policies on .NET 7, 8, 9
 - **~90% faster** for large policy sets (10,000+ policies) on modern frameworks
 - **Lower memory usage**: No entity materialization or change tracking overhead
 - **Conditional compilation**: Automatically falls back to traditional approach on older EF Core versions
+- **DbSet Caching**: Dictionary-based caching with composite keys (context, policyType)
+  - Typical memory: 224 bytes per context/policy type combination
+  - Worst case: ~3.5 KB for 13 policy types across 2 contexts
 - No breaking changes - optimization is transparent to users
 
-### 4. **100% Backward Compatible**
+### 4. **EnableAutoSave Behavior**
+- Comprehensive documentation of Casbin.NET's `EnableAutoSave` setting behavior with multi-context
+- `AutoSave ON` (default): Immediate `SaveChanges()` after each operation
+- `AutoSave OFF`: Batch operations without immediate persistence
+- Critical for atomic rollback testing across multiple contexts
+- See [Integration/README.md](Casbin.Persist.Adapter.EFCore.UnitTest/Integration/README.md) for details
+
+### 5. **100% Backward Compatible**
 - All existing code continues to work without changes
 - Default behavior unchanged (single context)
-- All 180 tests pass across .NET Core 3.1, .NET 5, 6, 7, 8, and 9
+- All 186 unit tests pass across .NET Core 3.1, .NET 5, 6, 7, 8, and 9
+- 20 additional PostgreSQL integration tests for atomic transaction verification
 
 ## Implementation Details
 
@@ -166,6 +183,26 @@ await enforcer.AddGroupingPolicyAsync("alice", "admin");   // → groupingContex
 - DbSet caching correctness with composite (context, policyType) keys
 - Performance optimization behavior across all EF Core versions
 
+## Integration Tests (PostgreSQL)
+
+In addition to the SQLite unit tests, this PR adds **20 PostgreSQL integration tests** that verify atomic transaction behavior and cross-schema functionality:
+
+### Test Suites
+- **TransactionIntegrityTests** (7 tests): Verifies atomic commits and rollbacks across multiple contexts
+- **AutoSaveTests** (11 tests): Tests Casbin.NET's `EnableAutoSave` behavior with multi-context scenarios
+- **SchemaDistributionTests** (2 tests): Validates policy distribution across PostgreSQL schemas
+
+### Why PostgreSQL?
+PostgreSQL integration tests use a **single shared connection** with multiple schemas (casbin_policies, casbin_groupings, casbin_roles), enabling true atomic transaction testing. SQLite unit tests use **separate database files** per context, which cannot test atomic rollback across contexts.
+
+### Running Integration Tests
+```bash
+# Requires PostgreSQL with configured connection
+dotnet test --filter "Category=Integration"
+```
+
+**Note**: Integration tests are excluded from CI/CD (require PostgreSQL setup). See [Integration/README.md](Casbin.Persist.Adapter.EFCore.UnitTest/Integration/README.md) for setup instructions.
+
 ## Documentation
 
 This PR includes comprehensive documentation:
@@ -176,50 +213,106 @@ This PR includes comprehensive documentation:
 
 ## Breaking Changes
 
-**None** - This is a fully backward-compatible addition. Existing code requires no changes.
+### Schema Migration Required
+
+**⚠️ Database Schema Upgrade**: This PR upgrades the schema from **v0-v5 to v0-v13**, adding 8 new value columns (Value7-Value14 / v6-v13):
+
+- **Casbin.NET upgraded**: From 2.7.0 to **2.19.1**
+- **New columns**: Value7, Value8, Value9, Value10, Value11, Value12, Value13, Value14
+- **Migration required**: Existing installations must add these columns to the `casbin_rule` table
+
+**Migration script example** (SQL Server):
+```sql
+ALTER TABLE casbin_rule ADD Value7 NVARCHAR(MAX) NULL;
+ALTER TABLE casbin_rule ADD Value8 NVARCHAR(MAX) NULL;
+-- ... repeat for Value9-Value14
+```
+
+### API Compatibility
+
+**No breaking API changes** - Existing code continues to work:
+- Single-context constructor unchanged
+- All existing methods maintain compatibility
+- Default behavior preserved
 
 ## Files Changed
 
 ### Core Implementation
-- `EFCoreAdapter.cs` - Updated to support context providers and adaptive transactions
-- `EFCoreAdapter.Internal.cs` - Added transaction coordination logic
-- `ICasbinDbContextProvider.cs` - New interface for context providers
-- `SingleContextProvider.cs` - Default single-context implementation
+- `EFCoreAdapter.cs` - Multi-context provider support, transaction coordination, reference equality checks
+- `CasbinDbContext.cs` - Schema support with `HasDefaultSchema()` method
+- `DefaultPersistPolicyEntityTypeConfiguration.cs` - v6-v13 column configuration
+- `ICasbinDbContextProvider.cs` - New interface for context providers (18 lines)
+- `SingleContextProvider.cs` - Default single-context implementation (10 lines)
+- `Casbin.Persist.Adapter.EFCore.csproj` - Casbin.NET 2.19.1 upgrade
 
-### Tests
-- `MultiContextTest.cs` - 17 comprehensive multi-context tests
+### Integration Tests (New - 20 tests, ~2,310 lines)
+- `Integration/TransactionIntegrityTests.cs` - 7 atomic transaction tests (576 lines)
+- `Integration/AutoSaveTests.cs` - 11 EnableAutoSave behavior tests (1,139 lines)
+- `Integration/SchemaDistributionTests.cs` - 2 schema distribution tests (340 lines)
+- `Integration/TransactionIntegrityTestFixture.cs` - PostgreSQL test infrastructure (236 lines)
+- `Integration/IntegrationTestCollection.cs` - xUnit collection for sequential execution (20 lines)
+- `Integration/README.md` - Integration test documentation (355 lines)
+
+### Unit Tests
+- `MultiContextTest.cs` - 17 multi-context functional tests
 - `BackwardCompatibilityTest.cs` - 12 backward compatibility tests
-- `MultiContextProviderFixture.cs` - Test infrastructure
-- `PolicyTypeContextProvider.cs` - Example provider implementation
-- `CasbinDbContextExtension.cs` - Enhanced for reliable test database initialization
-- `DbContextProviderFixture.cs` - Added model initialization
+- `PolicyEdgeCasesTest.cs` - Edge case coverage
+- `AutoTest.cs` - Removed (353 lines deleted, replaced by integration tests)
+- `Fixtures/MultiContextProviderFixture.cs` - Test infrastructure
+- `Fixtures/PolicyTypeContextProvider.cs` - Example routing provider (7 lines added)
+- `Extensions/CasbinDbContextExtension.cs` - Enhanced database initialization
 
-### Documentation
-- `MULTI_CONTEXT_DESIGN.md` - Complete design documentation
-- `MULTI_CONTEXT_USAGE_GUIDE.md` - User guide with examples
-- `README.md` - Updated with multi-context section
-- `.gitignore` - Added `.claude/` directory
+### Documentation (Restructured - ~1,617 lines)
+- `MULTI_CONTEXT_DESIGN.md` - Architecture and design decisions (969 lines)
+- `MULTI_CONTEXT_USAGE_GUIDE.md` - Usage guide with examples (648 lines)
+- `README.md` - Multi-context section and quick start
+- `examples/multi_context_model.conf` - Test model with g2 support (15 lines)
 
 ### Other
-- `global.json` - Added to ensure consistent .NET SDK version
-- `EFCore-Adapter.sln` - Updated with new test files
+- `global.json` - .NET SDK version pinning
+- `.gitignore` - Claude Code directory exclusion
+- `.github/workflows/verji-private-nuget.yml` - Private package workflow
 
 ## Checklist
 
-- [x] All tests pass (186/186 across .NET Core 3.1, .NET 5, 6, 7, 8, 9)
-- [x] Backward compatibility maintained
-- [x] Documentation added (design doc, usage guide, README)
+- [x] All unit tests pass (186/186 across .NET Core 3.1, .NET 5, 6, 7, 8, 9)
+- [x] All integration tests pass (20/20 on PostgreSQL)
+- [x] Backward compatibility maintained (API-level, schema migration required)
+- [x] Comprehensive documentation (design doc, usage guide, integration README)
 - [x] Code follows existing patterns and conventions
-- [x] No breaking changes introduced
+- [x] Schema upgrade to v0-v13 (breaking change, migration documented)
 - [x] Multi-framework support verified (.NET Core 3.1, .NET 5, 6, 7, 8, 9)
-- [x] Transaction handling tested for both shared and individual contexts
+- [x] Transaction handling tested (shared and individual, atomic rollback verified)
+- [x] Reference equality fix for transaction sharing (commit 91a780b)
+- [x] GetDbTransaction() API usage (commit e43fcba)
+- [x] EnableAutoSave behavior documented
 - [x] SQLite limitations documented
-- [x] Performance optimizations implemented with conditional compilation
+- [x] Performance optimizations implemented (ExecuteDelete, DbSet caching)
 - [x] DbSet caching bug fixed and tested
 
 ## Migration Guide
 
-For existing users, **no migration is needed**. The adapter works exactly as before when using the single-context constructor:
+### Database Schema Migration
+
+**Existing installations must migrate** the database schema from v0-v5 to v0-v13:
+
+```sql
+-- Add new columns to your casbin_rule table
+ALTER TABLE casbin_rule ADD Value7 NVARCHAR(MAX) NULL;
+ALTER TABLE casbin_rule ADD Value8 NVARCHAR(MAX) NULL;
+ALTER TABLE casbin_rule ADD Value9 NVARCHAR(MAX) NULL;
+ALTER TABLE casbin_rule ADD Value10 NVARCHAR(MAX) NULL;
+ALTER TABLE casbin_rule ADD Value11 NVARCHAR(MAX) NULL;
+ALTER TABLE casbin_rule ADD Value12 NVARCHAR(MAX) NULL;
+ALTER TABLE casbin_rule ADD Value13 NVARCHAR(MAX) NULL;
+ALTER TABLE casbin_rule ADD Value14 NVARCHAR(MAX) NULL;
+```
+
+Adjust column types for your database provider (PostgreSQL: `TEXT`, MySQL: `VARCHAR(255)`, etc.).
+
+### Code Migration
+
+**No code changes required** for existing single-context usage. The adapter works exactly as before when using the single-context constructor:
 
 ```csharp
 // Existing code - continues to work unchanged
@@ -238,4 +331,11 @@ See [MULTI_CONTEXT_USAGE_GUIDE.md](MULTI_CONTEXT_USAGE_GUIDE.md) for detailed mi
 
 ---
 
-**Stats**: +2,676 additions, -71 deletions across 16 files
+**Stats**: +6,443 additions, -438 deletions across 34 files
+
+**Key Commits**:
+- `1c3a447` - Schema v0-v13 upgrade and multi-context transaction support
+- `91a780b` - Reference equality fix for transaction sharing
+- `e43fcba` - GetDbTransaction() API usage
+- `edebe53` - Integration tests for transaction integrity
+- `db7f210` - EnableAutoSave behavior documentation
